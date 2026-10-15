@@ -1,0 +1,163 @@
+#!/bin/sh
+#
+# This is the custom tests file for Lynis.
+# Written in Bourne shell (not bash) — no arrays, no bash-only substitutions.
+#
+# How this file gets picked up:
+#   File must be named exactly 'tests_custom' and placed in Lynis's
+#   include directory. Find it with: lynis show includedir
+#   No profile entry is needed — Lynis runs tests_custom automatically
+#   if the file exists, as its own "Custom tests" step in the audit cycle.
+#
+# Author: Adithiya
+#
+
+#################################################################################
+#
+# Test        : CUST-1010
+# Description : Detect processes whose backing executable was deleted from disk
+#               while still running in memory (common malware self-deletion trick)
+
+Register --test-no CUST-1010 --weight L --network NO --category security \
+    --description "Check for processes running from deleted executables"
+
+if [ ${SKIPTEST} -eq 0 ]; then
+
+    FOUND_DELETED=0
+
+    for pid_path in /proc/[0-9]*; do
+        pid=$(basename "${pid_path}")
+        exe_link=$(readlink "${pid_path}/exe" 2>/dev/null)
+
+        [ -z "${exe_link}" ] && continue
+
+        case "${exe_link}" in
+            *"(deleted)"*)
+                FOUND_DELETED=1
+                cmdline=$(tr '\0' ' ' < "${pid_path}/cmdline" 2>/dev/null)
+                owner=$(ps -o user= -p "${pid}" 2>/dev/null)
+
+                LogText "Result: PID ${pid} (owner: ${owner}) is running a deleted executable: ${exe_link}"
+                LogText "Result: cmdline for PID ${pid}: ${cmdline}"
+
+                ReportWarning "${TEST_NO}" "Process PID ${pid} (${owner}) is running from a deleted executable" \
+                    "${exe_link}" "text:Investigate PID ${pid}; a self-deleted binary can indicate malware persistence"
+                ;;
+        esac
+    done
+
+    if [ ${FOUND_DELETED} -eq 0 ]; then
+        LogText "Result: no processes running from deleted executables were found"
+        Display --indent 2 --text "- Checking for deleted-but-running executables" --result "${STATUS_OK}" --color GREEN
+    else
+        Display --indent 2 --text "- Checking for deleted-but-running executables" --result "${STATUS_WARNING}" --color RED
+    fi
+fi
+
+#################################################################################
+#
+# Test        : CUST-1020
+# Description : Detect processes executing from temp/world-writable directories
+#               (/tmp, /dev/shm, /var/tmp) - common malware drop locations
+
+Register --test-no CUST-1020 --weight L --network NO --category security \
+    --description "Check for processes executing from temp directories"
+
+if [ ${SKIPTEST} -eq 0 ]; then
+
+    FOUND_TEMP=0
+
+    for pid_path in /proc/[0-9]*; do
+        pid=$(basename "${pid_path}")
+        exe_target=$(readlink -f "${pid_path}/exe" 2>/dev/null)
+
+        [ -z "${exe_target}" ] && continue
+
+        case "${exe_target}" in
+            /tmp/*|/dev/shm/*|/var/tmp/*)
+                FOUND_TEMP=1
+                cmdline=$(tr '\0' ' ' < "${pid_path}/cmdline" 2>/dev/null)
+                owner=$(ps -o user= -p "${pid}" 2>/dev/null)
+
+                LogText "Result: PID ${pid} (owner: ${owner}) is executing from ${exe_target}"
+                LogText "Result: cmdline for PID ${pid}: ${cmdline}"
+
+                ReportWarning "${TEST_NO}" "Process PID ${pid} (${owner}) is executing from a temp directory" \
+                    "${exe_target}" "text:Investigate PID ${pid}; execution from a world-writable temp dir is unusual"
+                ;;
+        esac
+    done
+
+    if [ ${FOUND_TEMP} -eq 0 ]; then
+        LogText "Result: no processes executing from temp directories were found"
+        Display --indent 2 --text "- Checking for processes running from temp directories" --result "${STATUS_OK}" --color GREEN
+    else
+        Display --indent 2 --text "- Checking for processes running from temp directories" --result "${STATUS_WARNING}" --color RED
+    fi
+fi
+
+#################################################################################
+#
+# Test        : CUST-1030
+# Description : Flag shell/interpreter processes (bash, sh, python, perl, socat,
+#               nc, etc.) that currently hold an active TCP socket - a common
+#               signature of reverse shells or unauthorized remote access.
+
+if command -v ss >/dev/null 2>&1; then PREQS_MET="YES"; else PREQS_MET="NO"; fi
+
+Register --test-no CUST-1030 --preqs-met ${PREQS_MET} --weight L --network NO --category security \
+    --description "Check for shell/interpreter processes holding active network sockets"
+
+if [ ${SKIPTEST} -eq 0 ]; then
+
+    WATCHLIST="bash sh dash zsh ksh python python3 perl ruby php socat nc ncat netcat"
+    FOUND=0
+
+    # ss -tnp: TCP sockets, numeric (no DNS lookups), with owning process
+    ss -tnp 2>/dev/null | tail -n +2 > /tmp/.cust1030_sockets.$$
+
+    while read -r line; do
+        case "${line}" in
+            *"users:(("*) ;;
+            *) continue ;;
+        esac
+
+        local_addr=$(echo "${line}" | awk '{print $4}')
+        peer_addr=$(echo "${line}"  | awk '{print $5}')
+        state=$(echo "${line}"      | awk '{print $1}')
+        pid=$(echo "${line}" | sed -n 's/.*pid=\([0-9]*\).*/\1/p')
+
+        [ -z "${pid}" ] && continue
+
+        real_comm=$(cat "/proc/${pid}/comm" 2>/dev/null)
+        [ -z "${real_comm}" ] && continue
+
+        for watched in ${WATCHLIST}; do
+            if [ "${real_comm}" = "${watched}" ]; then
+                FOUND=1
+                cmdline=$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null)
+                owner=$(ps -o user= -p "${pid}" 2>/dev/null)
+
+                LogText "Result: PID ${pid} (${real_comm}, owner: ${owner}) holds socket state=${state} local=${local_addr} peer=${peer_addr}"
+                LogText "Result: cmdline for PID ${pid}: ${cmdline}"
+
+                ReportWarning "${TEST_NO}" "Interpreter/shell '${real_comm}' (PID ${pid}, ${owner}) holds an active network socket" \
+                    "${peer_addr}" "text:Investigate PID ${pid}; verify this connection is expected (e.g. an SSH session) and not a reverse shell"
+                break
+            fi
+        done
+    done < /tmp/.cust1030_sockets.$$
+
+    rm -f /tmp/.cust1030_sockets.$$
+
+    if [ ${FOUND} -eq 0 ]; then
+        LogText "Result: no shell/interpreter processes with active network sockets were found"
+        Display --indent 2 --text "- Checking for shells/interpreters holding network sockets" --result "${STATUS_OK}" --color GREEN
+    else
+        Display --indent 2 --text "- Checking for shells/interpreters holding network sockets" --result "${STATUS_WARNING}" --color RED
+    fi
+fi
+
+#################################################################################
+
+#EOF
